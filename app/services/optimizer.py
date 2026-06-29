@@ -44,6 +44,30 @@ class StaffingOptimizer:
         required_level = levels.get(projet.required_seniority.lower(), 1)
         return collab_level >= required_level
 
+    def _compute_availability_score(self, collab: Collaborateur) -> int:
+        """Score de disponibilité (0-100) en tenant compte des absences/congés."""
+        base_score = min(100, int(max(0, collab.available_days) / 220 * 100))
+
+        # Pénalité liée au volume d'absence sur 12 mois.
+        absence_days = max(0, collab.absence_days_last_12_months)
+        absence_penalty = int(min(35, (absence_days / 220) * 100 * 0.35))
+
+        # Pénalité légère selon le type d'absence principal.
+        absence_type = (collab.main_absence_type or "").strip().lower()
+        type_penalty_map = {
+            "maladie": 12,
+            "sick leave": 12,
+            "long leave": 15,
+            "conge longue duree": 15,
+            "maternite": 8,
+            "maternity": 8,
+            "vacation": 2,
+            "conge annuel": 2,
+        }
+        type_penalty = type_penalty_map.get(absence_type, 0)
+
+        return max(0, min(100, base_score - absence_penalty - type_penalty))
+
     def solve(self) -> OptimizationResponse:
         """Résout le problème d'affectation avec CP-SAT."""
         start_time = time.time()
@@ -56,7 +80,7 @@ class StaffingOptimizer:
             return OptimizationResponse(
                 plan=[],
                 global_score=0.0,
-                metrics={"tnf_score": 0, "cost_score": 0, "balance_score": 0},
+                metrics={"tnf_score": 0, "skills_score": 0, "cost_score": 0, "balance_score": 0},
                 solver_status="NO_DATA",
                 computation_time_ms=0.0,
             )
@@ -100,6 +124,11 @@ class StaffingOptimizer:
         for i in range(num_collabs):
             cost_scores[i] = int((1 - self.collaborateurs[i].daily_cost / max_cost) * 100) if max_cost > 0 else 50
 
+        # Pré-calcul des scores de disponibilité en tenant compte des absences/congés
+        availability_scores = {}
+        for i in range(num_collabs):
+            availability_scores[i] = self._compute_availability_score(self.collaborateurs[i])
+
         # Objectif: maximiser le score global pondéré
         objective_terms = []
         w_skills = int(self.weights.skills_match * 100)
@@ -108,13 +137,14 @@ class StaffingOptimizer:
 
         for i in range(num_collabs):
             for j in range(num_projets):
+                # Priorité projet: plus le projet est prioritaire, plus son utilité est favorisée.
+                priority_weight = max(1, min(5, self.projets[j].priority)) * 20
                 # Score skills pondéré
-                objective_terms.append(x[i, j] * skills_scores[i, j] * w_skills)
+                objective_terms.append(x[i, j] * skills_scores[i, j] * w_skills * priority_weight)
                 # Score coût pondéré
-                objective_terms.append(x[i, j] * cost_scores[i] * w_cost)
+                objective_terms.append(x[i, j] * cost_scores[i] * w_cost * priority_weight)
                 # Score disponibilité pondéré
-                avail_score = min(100, int(self.collaborateurs[i].available_days / 220 * 100))
-                objective_terms.append(x[i, j] * avail_score * w_availability)
+                objective_terms.append(x[i, j] * availability_scores[i] * w_availability * priority_weight)
 
         model.maximize(sum(objective_terms))
 
@@ -137,7 +167,7 @@ class StaffingOptimizer:
             return OptimizationResponse(
                 plan=[],
                 global_score=0.0,
-                metrics={"tnf_score": 0, "cost_score": 0, "balance_score": 0},
+                metrics={"tnf_score": 0, "skills_score": 0, "cost_score": 0, "balance_score": 0},
                 solver_status=status_name,
                 computation_time_ms=computation_time,
             )
@@ -171,7 +201,7 @@ class StaffingOptimizer:
 
         # Calcul des métriques agrégées
         n = max(total_alloc, 1)
-        tnf_score = round((total_skills_score / n) * 100, 1)
+        skills_score_avg = round((total_skills_score / n) * 100, 1)
         cost_score_avg = round((total_cost_score / n) * 100, 1)
 
         # Score d'équilibre: mesure la répartition de la charge
@@ -186,6 +216,12 @@ class StaffingOptimizer:
             balance_score = round(max(0, 100 - variance**0.5), 1)
         else:
             balance_score = 0.0
+
+        # TNF (taux de non-facturation) inversé en score: 100 = aucune capacité inutilisée.
+        total_capacity_pct = num_collabs * 100
+        used_capacity_pct = sum(alloc_per_collab)
+        utilization_pct = (used_capacity_pct / total_capacity_pct * 100) if total_capacity_pct > 0 else 0.0
+        tnf_score = round(max(0.0, min(100.0, utilization_pct)), 1)
 
         global_score = round(
             tnf_score * self.weights.skills_match
@@ -202,6 +238,7 @@ class StaffingOptimizer:
             global_score=global_score,
             metrics={
                 "tnf_score": tnf_score,
+                "skills_score": skills_score_avg,
                 "cost_score": cost_score_avg,
                 "balance_score": balance_score,
             },
