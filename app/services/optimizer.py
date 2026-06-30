@@ -96,9 +96,10 @@ class StaffingOptimizer:
         for i in range(num_collabs):
             model.add(sum(x[i, j] for j in range(num_projets)) <= 5)
 
-        # Contrainte headcount: chaque projet doit avoir au moins headcount_needed collaborateurs affectés
+        # Contrainte headcount: chaque projet doit avoir exactement headcount_needed collaborateurs affectés
         for j in range(num_projets):
             projet = self.projets[j]
+            required_headcount = max(0, projet.headcount_needed)
             # Un collaborateur est "affecté" s'il a au moins 1 palier (20%)
             assigned = []
             for i in range(num_collabs):
@@ -106,7 +107,7 @@ class StaffingOptimizer:
                 model.add(x[i, j] >= 1).only_enforce_if(b)
                 model.add(x[i, j] == 0).only_enforce_if(b.negated())
                 assigned.append(b)
-            model.add(sum(assigned) <= projet.headcount_needed * 2)  # Plafond souple
+            model.add(sum(assigned) == required_headcount)
 
         # Pré-calcul des scores skills (multiplié par 100 pour rester en entiers)
         skills_scores = {}
@@ -177,6 +178,7 @@ class StaffingOptimizer:
         total_skills_score = 0.0
         total_cost_score = 0.0
         total_alloc = 0
+        total_availability_score = 0.0
 
         for i in range(num_collabs):
             for j in range(num_projets):
@@ -197,12 +199,14 @@ class StaffingOptimizer:
                     )
                     total_skills_score += skill_score
                     total_cost_score += cost_scores[i] / 100.0
+                    total_availability_score += availability_scores[i] / 100.0
                     total_alloc += 1
 
         # Calcul des métriques agrégées
         n = max(total_alloc, 1)
         skills_score_avg = round((total_skills_score / n) * 100, 1)
         cost_score_avg = round((total_cost_score / n) * 100, 1)
+        availability_score_avg = round((total_availability_score / n) * 100, 1)
 
         # Score d'équilibre: mesure la répartition de la charge
         alloc_per_collab = [0] * num_collabs
@@ -224,8 +228,9 @@ class StaffingOptimizer:
         tnf_score = round(max(0.0, min(100.0, utilization_pct)), 1)
 
         global_score = round(
-            tnf_score * self.weights.skills_match
+            skills_score_avg * self.weights.skills_match
             + cost_score_avg * self.weights.cost
+            + availability_score_avg * self.weights.availability
             + balance_score * self.weights.balance,
             1,
         )
@@ -240,6 +245,7 @@ class StaffingOptimizer:
                 "tnf_score": tnf_score,
                 "skills_score": skills_score_avg,
                 "cost_score": cost_score_avg,
+                "availability_score": availability_score_avg,
                 "balance_score": balance_score,
             },
             solver_status=status_name,
